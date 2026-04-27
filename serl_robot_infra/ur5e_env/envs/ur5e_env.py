@@ -38,10 +38,7 @@ import rtde_control
 import rtde_receive
 
 from ur5e_env.utils.rotations import (
-    euler_2_quat,
-    quat_2_euler,
-    pose_euler_to_rotvec,
-    pose_rotvec_to_euler,
+    rotvec_2_quat,
     pose_rotvec_to_quat,
     pose_quat_to_rotvec,
 )
@@ -84,7 +81,7 @@ class DefaultUR5eEnvConfig:
     """
 
     # UR5e network address
-    ROBOT_IP: str = "192.168.1.100"
+    ROBOT_IP: str = "192.168.1.103"
 
     # RTDE servo parameters
     SERVO_LOOKAHEAD_TIME: float = 0.1   # seconds (0.03 – 0.2)
@@ -103,7 +100,7 @@ class DefaultUR5eEnvConfig:
     # Callable crops:  IMAGE_CROP = {"wrist_1": lambda img: img[y0:y1, x0:x1]}
     IMAGE_CROP: Dict = {}
 
-    # Poses in [x, y, z, rx, ry, rz] with euler angles (radians)
+    # Poses in [x, y, z, rx, ry, rz] as rotvec (axis-angle, UR native format, radians)
     TARGET_POSE:  np.ndarray = np.zeros(6)
     RESET_POSE:   np.ndarray = np.zeros(6)
     REWARD_THRESHOLD: np.ndarray = np.array([0.01, 0.01, 0.01, 0.05, 0.05, 0.05])
@@ -111,7 +108,7 @@ class DefaultUR5eEnvConfig:
     # Action scale: (translation_m, rotation_rad, gripper)
     ACTION_SCALE = (0.01, 0.06, 1.0)
 
-    # Workspace safety bounding box (euler pose)
+    # Workspace safety bounding box (rotvec pose)
     ABS_POSE_LIMIT_LOW:  np.ndarray = np.zeros(6)
     ABS_POSE_LIMIT_HIGH: np.ndarray = np.zeros(6)
 
@@ -124,11 +121,16 @@ class DefaultUR5eEnvConfig:
     RESET_JOINTS: np.ndarray = np.array([0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0])
 
     # Gripper parameters
-    # Set GRIPPER_TYPE to "robotiq" (RS-485 via ur-rtde) or "none"
-    GRIPPER_TYPE: str = "robotiq"
-    GRIPPER_SPEED: float = 0.5     # 0-1
-    GRIPPER_FORCE: float = 0.5     # 0-1
-    GRIPPER_SLEEP: float = 0.6     # seconds to wait after gripper cmd
+    # GRIPPER_TYPE: "robotiq" (Modbus RTU via serial port) or "none"
+    GRIPPER_TYPE:  str   = "robotiq"
+    GRIPPER_PORT:  str   = "/dev/ttyUSB0"  # serial port for Modbus RTU
+    # GRIPPER_SPEED / FORCE: 0-255 (passed directly to HandEForRtu.move)
+    GRIPPER_SPEED: int   = 150   # 0-255
+    GRIPPER_FORCE: int   = 0     # 0-255
+    GRIPPER_SLEEP: float = 0.6   # seconds to wait after gripper cmd
+    # Fully open position in mm (HandEForRtu.FULL_POS = 50 mm)
+    GRIPPER_OPEN_MM:  float = 50.0
+    GRIPPER_CLOSE_MM: float = 0.0
 
     DISPLAY_IMAGE:      bool = True
     MAX_EPISODE_LENGTH: int  = 100
@@ -250,6 +252,7 @@ class UR5eEnv(gym.Env):
         self.currforce      = np.zeros(3)
         self.currtorque     = np.zeros(3)
         self.curr_gripper_pos = np.array([0.0])   # 0 = open, 1 = closed
+        self._gripper_is_closed = False           # software-side latch (used in _send_gripper_command)
         self.curr_path_length = 0
 
         # terminate flag (set by keyboard ESC listener inside wrappers)
@@ -266,18 +269,21 @@ class UR5eEnv(gym.Env):
         self.rtde_r = rtde_receive.RTDEReceiveInterface(config.ROBOT_IP)
         print("[UR5eEnv] RTDE connected.")
 
-        # Gripper (Robotiq 2F via ur-rtde built-in support)
-        self._gripper_is_closed = False
+        # Gripper (Robotiq Hand-E via Modbus RTU over serial)
+        self.gripper = None
         if config.GRIPPER_TYPE == "robotiq":
-            from rtde_control import GripperSocketClient
-            self.gripper = GripperSocketClient(config.ROBOT_IP)
-            self.gripper.connect()
-            self.gripper.activate()
-            time.sleep(2)
-            self.gripper.move(0, config.GRIPPER_SPEED, config.GRIPPER_FORCE)  # open
+            from ur5e_env.keyboard.robotiq.HandE import HandEForRtu
+            print(f"[UR5eEnv] Initialising Robotiq gripper on {config.GRIPPER_PORT} …")
+            self.gripper = HandEForRtu(config.GRIPPER_PORT, autoInit=True)
+            # Open gripper at startup
+            self.gripper.move(
+                pos=config.GRIPPER_OPEN_MM,
+                speed=config.GRIPPER_SPEED,
+                force=config.GRIPPER_FORCE,
+                block=True,
+            )
             time.sleep(config.GRIPPER_SLEEP)
-        else:
-            self.gripper = None
+            print("[UR5eEnv] Robotiq gripper ready (open).")
 
         # ------------------------------------------------------------------ #
         # Cameras
@@ -359,9 +365,9 @@ class UR5eEnv(gym.Env):
         """
         tcp_pose = obs["state"]["tcp_pose"]  # xyz + quat
         cur_rot    = Rotation.from_quat(tcp_pose[3:]).as_matrix()
-        target_rot = Rotation.from_euler("xyz", self._TARGET_POSE[3:]).as_matrix()
-        diff_euler = Rotation.from_matrix(cur_rot.T @ target_rot).as_euler("xyz")
-        delta = np.abs(np.hstack([tcp_pose[:3] - self._TARGET_POSE[:3], diff_euler]))
+        target_rot = Rotation.from_rotvec(self._TARGET_POSE[3:]).as_matrix()
+        diff_rotvec = Rotation.from_matrix(cur_rot.T @ target_rot).as_rotvec()
+        delta = np.abs(np.hstack([tcp_pose[:3] - self._TARGET_POSE[:3], diff_rotvec]))
         return bool(np.all(delta < self._REWARD_THRESHOLD))
 
     def close(self):
@@ -379,34 +385,25 @@ class UR5eEnv(gym.Env):
     # ====================================================================== #
 
     def clip_safety_box(self, pose_quat: np.ndarray) -> np.ndarray:
-        """Clip xyz+quat pose to the configured workspace bounding box."""
+        """Clip xyz+quat pose to the configured workspace bounding box (limits in rotvec)."""
         pose_quat[:3] = np.clip(
             pose_quat[:3],
             self.xyz_bounding_box.low,
             self.xyz_bounding_box.high,
         )
-        euler = Rotation.from_quat(pose_quat[3:]).as_euler("xyz")
-        sign = np.sign(euler[0])
-        euler[0] = sign * np.clip(
-            np.abs(euler[0]),
-            self.rpy_bounding_box.low[0],
-            self.rpy_bounding_box.high[0],
-        )
-        euler[1:] = np.clip(
-            euler[1:],
-            self.rpy_bounding_box.low[1:],
-            self.rpy_bounding_box.high[1:],
-        )
-        pose_quat[3:] = Rotation.from_euler("xyz", euler).as_quat()
+        # Clip in rotvec space (component-wise, matches config ABS_POSE_LIMIT rotvec format)
+        rotvec = Rotation.from_quat(pose_quat[3:]).as_rotvec()
+        rotvec = np.clip(rotvec, self.rpy_bounding_box.low, self.rpy_bounding_box.high)
+        pose_quat[3:] = Rotation.from_rotvec(rotvec).as_quat()
         return pose_quat
 
-    def interpolate_move(self, goal_euler: np.ndarray, timeout: float = 2.0):
+    def interpolate_move(self, goal_rotvec: np.ndarray, timeout: float = 2.0):
         """
-        Move smoothly to `goal_euler` ([x,y,z, rx,ry,rz] in euler) by linearly
-        interpolating poses and streaming via servoL.
+        Move smoothly to `goal_rotvec` ([x,y,z, rx,ry,rz] in rotvec / UR native format)
+        by linearly interpolating poses and streaming via servoL.
         """
         goal_quat = np.concatenate(
-            [goal_euler[:3], euler_2_quat(goal_euler[3:])]
+            [goal_rotvec[:3], rotvec_2_quat(goal_rotvec[3:])]
         )
         steps = max(2, int(timeout * self.hz))
         self._update_currpos()
@@ -461,11 +458,11 @@ class UR5eEnv(gym.Env):
         pose_rv = pose_quat_to_rotvec(pose_quat)
         self.rtde_c.servoL(
             list(pose_rv.astype(float)),
-            velocity=0.5,
-            acceleration=0.3,
-            dt=self.config.SERVO_DT,
-            lookahead_time=self.config.SERVO_LOOKAHEAD_TIME,
-            gain=self.config.SERVO_GAIN,
+            0.5,                              # velocity
+            0.3,                              # acceleration
+            self.config.SERVO_DT,             # dt
+            self.config.SERVO_LOOKAHEAD_TIME, # lookahead_time
+            self.config.SERVO_GAIN,           # gain
         )
 
     def _send_gripper_command(self, action: float, mode: str = "binary"):
@@ -480,17 +477,19 @@ class UR5eEnv(gym.Env):
         if mode == "binary":
             if action <= -0.5 and not self._gripper_is_closed:
                 self.gripper.move(
-                    255,  # fully closed
-                    int(self.config.GRIPPER_SPEED * 255),
-                    int(self.config.GRIPPER_FORCE * 255),
+                    self.config.GRIPPER_CLOSE_MM,
+                    self.config.GRIPPER_SPEED,
+                    self.config.GRIPPER_FORCE,
+                    block=True,
                 )
                 self._gripper_is_closed = True
                 time.sleep(self.gripper_sleep)
             elif action >= 0.5 and self._gripper_is_closed:
                 self.gripper.move(
-                    0,    # fully open
-                    int(self.config.GRIPPER_SPEED * 255),
-                    int(self.config.GRIPPER_FORCE * 255),
+                    self.config.GRIPPER_OPEN_MM,
+                    self.config.GRIPPER_SPEED,
+                    self.config.GRIPPER_FORCE,
+                    block=True,
                 )
                 self._gripper_is_closed = False
                 time.sleep(self.gripper_sleep)
@@ -509,8 +508,13 @@ class UR5eEnv(gym.Env):
         self.currforce  = ft[:3]
         self.currtorque = ft[3:]
 
-        # Gripper state (normalised: 0=open, 1=closed)
-        self.curr_gripper_pos = np.array([float(self._gripper_is_closed)])
+        # Gripper state: normalised to [0=open, 1=closed]
+        if self.gripper is not None:
+            pos_mm = self.gripper.position  # real position in mm from Modbus
+            open_mm = max(self.config.GRIPPER_OPEN_MM, 1e-6)  # avoid div/0
+            self.curr_gripper_pos = np.array([1.0 - float(pos_mm) / open_mm])
+        else:
+            self.curr_gripper_pos = np.array([float(self._gripper_is_closed)])
 
     def _recover(self):
         """Clear protective stops / errors."""

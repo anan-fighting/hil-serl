@@ -174,9 +174,9 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
             if "right" in info:
                 info.pop("right")
 
-            # override the action with the intervention action
+            # override the action with the intervention action 判断是否发生了干预
             if "intervene_action" in info:
-                actions = info.pop("intervene_action")
+                actions = info.pop("intervene_action") # 用人类动作替换策略动作
                 intervention_steps += 1
                 if not already_intervened:
                     intervention_count += 1
@@ -195,8 +195,10 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
             )
             if 'grasp_penalty' in info:
                 transition['grasp_penalty']= info['grasp_penalty']
+            # 所有 transition 存入主缓冲区
             data_store.insert(transition)
             transitions.append(copy.deepcopy(transition))
+            # 干预期间的 transition 额外存入干预缓冲区（用于 DAgger/RLPD 比例采样）
             if already_intervened:
                 intvn_data_store.insert(transition)
                 demo_transitions.append(copy.deepcopy(transition))

@@ -45,7 +45,7 @@ class EnvConfig(DefaultUR5eEnvConfig):
     # ------------------------------------------------------------------
     # [1] 机器人 IP
     # ------------------------------------------------------------------
-    ROBOT_IP = "192.168.1.100"
+    ROBOT_IP = "192.168.1.103"
 
     # ------------------------------------------------------------------
     # [2] 相机配置
@@ -87,21 +87,23 @@ class EnvConfig(DefaultUR5eEnvConfig):
     }
 
     # ------------------------------------------------------------------
-    # [4] 关键位姿（Euler XYZ，单位：米 / 弧度）
-    #   采集方法：
+    # [4] 关键位姿（旋转矢量 rotvec，UR 原生格式，单位：米 / 弧度）
+    #   格式：[x, y, z, rx, ry, rz]，其中 (rx,ry,rz) = 旋转轴 × 旋转角度
+    #   采集方法：进入 FreeDrive 移动到目标点，然后运行：
     #     conda activate hilserl
     #     cd serl_robot_infra/ur5e_env/utils
-    #     python get_tcp_pose.py --robot_ip 192.168.1.100
+    #     python get_tcp_pose.py --robot_ip 192.168.1.103
+    #   将输出的 "Rotvec (UR native)" 一行直接填入下方。
     # ------------------------------------------------------------------
 
-    # USB 完全插入 USB 口时的末端位姿
+    # USB 完全插入 USB 口时的末端位姿（rotvec，需用 get_tcp_pose.py 实测采集）
     TARGET_POSE = np.array([0.553, 0.177, 0.251, np.pi, 0.0, -np.pi / 2])
 
-    # 每个 episode 开始时的末端位姿（比 TARGET_POSE 抬高 + 偏移一点）
+    # 每个 episode 开始时的末端位姿（rotvec，在 TARGET_POSE 基础上偏移）
     RESET_POSE = TARGET_POSE + np.array([0.0, 0.03, 0.05, 0.0, 0.0, 0.0])
 
     # ------------------------------------------------------------------
-    # [5] 安全探索边界
+    # [5] 安全探索边界（rotvec 分量，与 TARGET_POSE 同格式）
     # ------------------------------------------------------------------
     ABS_POSE_LIMIT_HIGH = TARGET_POSE + np.array([0.03, 0.06, 0.05, 0.1, 0.1, 0.3])
     ABS_POSE_LIMIT_LOW  = TARGET_POSE - np.array([0.03, 0.01, 0.03, 0.1, 0.1, 0.3])
@@ -122,10 +124,13 @@ class EnvConfig(DefaultUR5eEnvConfig):
     RESET_JOINTS = np.array([-1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0.0])
 
     # 夹爪
-    GRIPPER_TYPE  = "robotiq"
-    GRIPPER_SPEED = 0.5
-    GRIPPER_FORCE = 0.5
-    GRIPPER_SLEEP = 0.6
+    GRIPPER_TYPE     = "robotiq"
+    GRIPPER_PORT     = "/dev/ttyUSB0"   # Modbus RTU 串口
+    GRIPPER_SPEED    = 150              # 0-255，建议 100-200
+    GRIPPER_FORCE    = 0                # 0-255；0=最小夹持力（USB 插拔推荐）
+    GRIPPER_OPEN_MM  = 50.0             # Hand-E 全开约 50 mm
+    GRIPPER_CLOSE_MM = 0.0              # 全闭
+    GRIPPER_SLEEP    = 0.6              # 等待夹爪动作完成（秒）
 
     MAX_EPISODE_LENGTH = 120
     DISPLAY_IMAGE      = True

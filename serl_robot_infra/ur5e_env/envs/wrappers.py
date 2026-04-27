@@ -163,16 +163,16 @@ class KeyboardIntervention(gym.ActionWrapper):
         Returns (final_action, intervened: bool).
         Overrides gym.ActionWrapper.action() signature intentionally.
         """
-        expert_a, buttons = self.expert.get_action()
+        expert_a, buttons = self.expert.get_action() # 读键盘当前按下的键
         self._close_gripper, self._open_gripper = bool(buttons[0]), bool(buttons[1])
 
-        intervened = np.linalg.norm(expert_a) > 0.001
+        intervened = np.linalg.norm(expert_a) > 0.001 # 有运动键被按住
 
-        if self.gripper_enabled:
-            if self._close_gripper:
+        if self.gripper_enabled: 
+            if self._close_gripper: # F 键
                 gripper_action = np.random.uniform(-1, -0.9, size=(1,))
                 intervened = True
-            elif self._open_gripper:
+            elif self._open_gripper: # G 键
                 gripper_action = np.random.uniform(0.9, 1, size=(1,))
                 intervened = True
             else:
@@ -185,8 +185,8 @@ class KeyboardIntervention(gym.ActionWrapper):
             expert_a = filtered
 
         if intervened:
-            return expert_a, True
-        return action, False
+            return expert_a, True # ← 用键盘动作替换策略动作
+        return action, False # ← 策略动作原样通过
 
     def step(self, action):
         # Propagate terminate flag from keyboard ESC
@@ -196,7 +196,7 @@ class KeyboardIntervention(gym.ActionWrapper):
         new_action, replaced = self.action(action)
         obs, rew, done, truncated, info = self.env.step(new_action)
         if replaced:
-            info["intervene_action"] = new_action
+            info["intervene_action"] = new_action # ← 打上干预标记，训练循环识别
         info["close_gripper"] = self._close_gripper
         info["open_gripper"]  = self._open_gripper
         return obs, rew, done, truncated, info

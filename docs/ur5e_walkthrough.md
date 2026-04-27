@@ -37,6 +37,7 @@ serl_robot_infra/
     ├── keyboard/
     │   ├── __init__.py
     │   └── keyboard_expert.py         ← 键盘遥操模块（替代 SpaceMouse）
+    │   └── teleop_test.py             ← 键盘操控测试脚本
     └── utils/
         ├── __init__.py
         ├── rotations.py               ← Euler/Quat/Rotvec 转换工具
@@ -116,9 +117,9 @@ pip install -e .
 
 ### 3.1 UR5e 网络设置
 
-1. 在示教器：`设置 → 系统 → 网络` 中为 UR5e 分配固定 IP（例如 `192.168.1.100`）。
+1. 在示教器：`设置 → 系统 → 网络` 中为 UR5e 分配固定 IP（例如 `192.168.1.103`）。
 2. 将电脑网卡设置为同一网段（例如 `192.168.1.10/24`）。
-3. 测试连通性：`ping 192.168.1.100`
+3. 测试连通性：`ping 192.168.1.103`
 
 ### 3.2 开启 RTDE 远程控制
 
@@ -144,14 +145,20 @@ pip install -e .
 
 ## 4. 采集关键位姿
 
-所有关键位姿（`TARGET_POSE`、`RESET_POSE` 等）均以 **Euler XYZ 弧度** 格式存储。
+所有关键位姿（`TARGET_POSE`、`RESET_POSE`、`ABS_POSE_LIMIT_*`）均以 **旋转矢量 rotvec（UR 原生格式）** 存储：
+
+```
+[x, y, z, rx, ry, rz]
+```
+
+其中 `(rx, ry, rz)` 是旋转轴与旋转角度的乘积（axis-angle），即 `rtde_receive.getActualTCPPose()` 直接返回的格式，**无需任何转换**即可填入配置文件。
 
 ### 4.1 进入 FreeDrive 模式
 
 ```python
 # 在 Python 中临时开启 FreeDrive（或用示教器面板的 FreeDrive 按钮）
 import rtde_control
-rtde_c = rtde_control.RTDEControlInterface("192.168.1.100")
+rtde_c = rtde_control.RTDEControlInterface("192.168.1.103")
 rtde_c.teachMode()     # 进入 FreeDrive
 # 手动移动机械臂到目标位置…
 rtde_c.endTeachMode()  # 退出 FreeDrive
@@ -162,17 +169,16 @@ rtde_c.endTeachMode()  # 退出 FreeDrive
 ```bash
 conda activate hilserl
 cd serl_robot_infra/ur5e_env/utils
-python get_tcp_pose.py --robot_ip 192.168.1.100
+python get_tcp_pose.py --robot_ip 192.168.1.103
 ```
 
 输出示例：
 ```
 === UR5e Current TCP Pose ===
-  Rotvec (UR native): [0.4, -0.1, 0.2, 3.1416, 0.0, 0.0]
-  Euler XYZ (rad)   : [0.4, -0.1, 0.2, 3.1416, 0.0, 0.0]
-  Joint angles (rad): [-1.57, -1.57, 1.57, -1.57, -1.57, 0.0]
+  Rotvec (UR native) [x,y,z,rx,ry,rz]: [0.4, -0.1, 0.2, 3.1416, 0.0, 0.0]
+  Joint angles (rad)                  : [-1.57, -1.57, 1.57, -1.57, -1.57, 0.0]
 
-Copy the Euler XYZ line into your config.py as:
+Copy into your config.py as:
   TARGET_POSE = np.array([0.4, -0.1, 0.2, 3.1416, 0.0, 0.0])
 ```
 
@@ -193,7 +199,7 @@ Copy the Euler XYZ line into your config.py as:
 
 ```python
 class EnvConfig(DefaultUR5eEnvConfig):
-    ROBOT_IP = "192.168.1.100"       # ← 改为你的机器人 IP
+    ROBOT_IP = "192.168.1.103"       # ← 改为你的机器人 IP
 
     REALSENSE_CAMERAS = {
         "wrist_1": {
@@ -374,7 +380,7 @@ KEYBOARD_ANGULAR_SPEED = 1.0   # 旋转速度倍率
 
 ### Q1：连接 UR5e 失败 `RTDEControlInterface failed to connect`
 
-- 检查网络 ping 是否通：`ping 192.168.1.100`
+- 检查网络 ping 是否通：`ping 192.168.1.103`
 - 确认 UR5e 开启了**远程控制**模式
 - 确认没有其他 RTDE 客户端占用连接（UR5e 仅支持有限并发连接数）
 - 检查防火墙：`sudo ufw allow 30002,30004/tcp`
@@ -405,7 +411,7 @@ KEYBOARD_ANGULAR_SPEED = 1.0   # 旋转速度倍率
 ```bash
 # 代码内自动调用，也可手动：
 import rtde_control
-rtde_c = rtde_control.RTDEControlInterface("192.168.1.100")
+rtde_c = rtde_control.RTDEControlInterface("192.168.1.103")
 rtde_c.unlockProtectiveStop()
 ```
 

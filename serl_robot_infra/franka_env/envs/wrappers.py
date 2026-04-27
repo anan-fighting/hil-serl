@@ -223,18 +223,20 @@ class SpacemouseIntervention(gym.ActionWrapper):
         Output:
         - action: spacemouse action if nonezero; else, policy action
         """
+        # 读 SpaceMouse 当前状态
         expert_a, buttons = self.expert.get_action()
         self.left, self.right = tuple(buttons)
         intervened = False
         
+        # SpaceMouse 有物理位移
         if np.linalg.norm(expert_a) > 0.001:
             intervened = True
 
         if self.gripper_enabled:
-            if self.left:  # close gripper
+            if self.left:  # close gripper，左键按下 → 关夹爪
                 gripper_action = np.random.uniform(-1, -0.9, size=(1,))
                 intervened = True
-            elif self.right:  # open gripper
+            elif self.right:  # open gripper，右键按下 → 开夹爪
                 gripper_action = np.random.uniform(0.9, 1, size=(1,))
                 intervened = True
             else:
@@ -246,9 +248,11 @@ class SpacemouseIntervention(gym.ActionWrapper):
             filtered_expert_a[self.action_indices] = expert_a[self.action_indices]
             expert_a = filtered_expert_a
 
+        # 干预中：发送 expert_a 给机器人
         if intervened:
             return expert_a, True
 
+        # 未干预：发送原始 policy_action 给机器人
         return action, False
 
     def step(self, action):
