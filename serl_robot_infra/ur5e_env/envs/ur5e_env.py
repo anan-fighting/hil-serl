@@ -63,10 +63,19 @@ class ImageDisplayer(threading.Thread):
             img_array = self.queue.get()
             if img_array is None:
                 break
-            frame = np.concatenate(
-                [cv2.resize(v, (128, 128)) for k, v in img_array.items() if "full" not in k],
-                axis=1,
-            )
+            # Prefer the full-resolution cropped images (key ends with "_full");
+            # fall back to the 128×128 policy images if no full-res is available.
+            full_keys = [k for k in img_array if k.endswith("_full")]
+            if full_keys:
+                frame = np.concatenate(
+                    [img_array[k] for k in full_keys],
+                    axis=1,
+                )
+            else:
+                frame = np.concatenate(
+                    [img_array[k] for k in img_array],
+                    axis=1,
+                )
             cv2.imshow(self.name, frame)
             cv2.waitKey(1)
 
@@ -84,16 +93,20 @@ class DefaultUR5eEnvConfig:
     ROBOT_IP: str = "192.168.1.103"
 
     # RTDE servo parameters
-    SERVO_LOOKAHEAD_TIME: float = 0.1   # seconds (0.03 – 0.2)
+    # lookahead_time should be >= 3×dt to blend successive commands smoothly.
+    # With dt=0.1s (10 Hz), setting lookahead=0.1 gives zero blending → robot
+    # "snaps" to each target.  Use 0.2–0.3s for smooth teleoperation feel.
+    SERVO_LOOKAHEAD_TIME: float = 0.2   # seconds (0.03 – 0.2); >= 2×SERVO_DT
     SERVO_GAIN: float = 300             # proportional gain (100 – 2000)
-    SERVO_DT: float = 0.002            # UR5e controller time-step (500 Hz)
+    # dt should match the actual command interval (1/hz = 0.1s at 10 Hz).
+    SERVO_DT: float = 0.1              # matches env hz (10 Hz → 0.1 s)
 
     # RealSense cameras  {name: {serial_number, dim, exposure}}
     REALSENSE_CAMERAS: Dict = {
         "wrist_1": {
             "serial_number": "REPLACE_WITH_SERIAL",
             "dim": (1280, 720),
-            "exposure": 40000,
+            "exposure": 25000,
         },
     }
 
@@ -319,6 +332,7 @@ class UR5eEnv(gym.Env):
             Rotation.from_rotvec(rotvec_delta) * Rotation.from_quat(self.currpos[3:])
         ).as_quat()
         next_pose_quat = np.concatenate([next_pos, next_quat])
+        # 把当前位姿强制夹到安全框边界内
         next_pose_quat = self.clip_safety_box(next_pose_quat)
 
         # Send commands
@@ -397,26 +411,34 @@ class UR5eEnv(gym.Env):
         pose_quat[3:] = Rotation.from_rotvec(rotvec).as_quat()
         return pose_quat
 
-    def interpolate_move(self, goal_rotvec: np.ndarray, timeout: float = 2.0):
+    def interpolate_move(self, goal_rotvec: np.ndarray, timeout: float = 2.0,
+                         max_cart_speed: float = 0.15):
         """
         Move smoothly to `goal_rotvec` ([x,y,z, rx,ry,rz] in rotvec / UR native format)
         by linearly interpolating poses and streaming via servoL.
+        移动平滑到目标姿态，通过线性插值姿态并通过servoL流式传输。
+
+        Args:
+            timeout:        最小行进时间（秒）。实际时间会延长，以确保笛卡尔速度永远不会超过`max_cart_speed`
+            max_cart_speed: 移动过程中的最大平移速度（米/秒）。
+                            默认值为0.15米/秒，可防止在离目标较远的位置启动时发生“飞车”现象。
         """
         goal_quat = np.concatenate(
             [goal_rotvec[:3], rotvec_2_quat(goal_rotvec[3:])]
         )
-        steps = max(2, int(timeout * self.hz))
         self._update_currpos()
+        # Dynamically extend timeout so cart speed ≤ max_cart_speed
+        cart_dist = float(np.linalg.norm(goal_rotvec[:3] - self.currpos[:3]))
+        min_time  = cart_dist / max(max_cart_speed, 1e-6)
+        timeout   = max(timeout, min_time)
+        steps = max(2, int(timeout * self.hz))
         # Interpolate in rotvec space (SLERP-like)
         r_start = Rotation.from_quat(self.currpos[3:])
         r_end   = Rotation.from_quat(goal_quat[3:])
         ts = np.linspace(0, 1, steps)
         for t in ts:
-            pos    = (1 - t) * self.currpos[:3] + t * goal_quat[:3]
-            r_interp = Rotation.from_quat(
-                Rotation.slerp(r_start, r_end, t) if False  # scipy ≥1.8
-                else _slerp(r_start, r_end, t)
-            ).as_rotvec()
+            pos     = (1 - t) * self.currpos[:3] + t * goal_quat[:3]
+            r_interp = _slerp(r_start, r_end, t)   # already returns rotvec (3,)
             self.rtde_c.servoL(
                 list(np.concatenate([pos, r_interp])),
                 0.5, 0.3,
@@ -425,6 +447,8 @@ class UR5eEnv(gym.Env):
                 self.config.SERVO_GAIN,
             )
             time.sleep(1.0 / self.hz)
+        # Exit servo mode cleanly so the controller doesn't "snap" on the next command.
+        self.rtde_c.servoStop()
         self._update_currpos()
 
     def go_to_reset(self, joint_reset: bool = False):

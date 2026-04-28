@@ -141,6 +141,9 @@ pip install -e .
 - 安装腕部相机后，在 **RealSense Viewer** 中查看并记录序列号。
 - 调整 `IMAGE_CROP` 裁剪参数（运行 `record_success_fail.py` 时可预览图像）。
 
+```bash
+(hilserl) zzw@zzw-ThinkBook:~/project/hil-serl/examples$ python record_success_fail.py --exp_name ur5e_usb_pickup_insertion --successes_needed 200
+```
 ---
 
 ## 4. 采集关键位姿
@@ -226,113 +229,239 @@ class EnvConfig(DefaultUR5eEnvConfig):
 
 ## 6. 训练奖励分类器
 
-### 6.1 采集分类器数据
+### 6.1 【目的】为什么需要奖励分类器？
+
+强化学习需要一个"奖励信号"来告诉策略什么是成功、什么是失败。
+
+USB 插入任务的成功状态（USB 完全插入孔位）**很难用简单的位置阈值判断**（因为不同角度、不同深度都可能看起来相似），所以我们用一个**基于图像的分类器**来判断：
+
+> 分类器输入：腕部相机当前帧图像  
+> 分类器输出：`成功（1）` 或 `失败（0）`
+
+这个分类器在训练阶段实时运行，每一步给出奖励信号。
+
+---
+
+### 6.2 【操作】采集分类器数据
+
+这一步的目标：**收集"USB 插好了"和"USB 没插好"的相机图像各若干帧**，用于训练分类器。
+
+**你需要做的事**：用键盘遥控机械臂，让末端在 USB 口附近移动，同时手动标记哪些帧是"成功状态"。
+
+#### 为什么必须用 `--skip_grasp` + 手动放入 USB？
+
+`reset()` 的完整抓取流程（Step 5）是从 `TARGET_POSE` **线性插值**移动到 `RESET_POSE`，XYZ 三轴同时运动。如果此时 USB 还插在孔里，机械臂会**斜向拔出**，可能碰撞端口或损坏 USB。
+
+`reset()` 在**训练/演示录制**时没有此问题，因为 Step 1 会先开夹爪放开 USB，USB 自由落下后再抬起。
+
+但在**分类器数据采集**阶段，USB 始终被夹持插入，因此必须跳过自动抓取流程，改为手动放入。
+
+---
+
+#### 操作流程
+
+**第一步**：加 `--skip_grasp` 运行脚本，机械臂移到 RESET_POSE（空手）：
 
 ```bash
 conda activate hilserl
 cd examples
-python record_success_fail.py --exp_name ur5e_usb_pickup_insertion --successes_needed 200
+python record_success_fail.py \
+    --exp_name ur5e_usb_pickup_insertion \
+    --successes_needed 200 \
+    --skip_grasp
 ```
 
-**操作方法**（键盘控制）：
+**第二步**：脚本进入采集循环后，**手动将 USB 放入夹爪之间，然后按住键盘 `F` 键关闭夹爪夹住 USB**。
 
-| 按键 | 效果 |
+> ⚠️ 注意：此时终端需要保持焦点（鼠标点击终端窗口），F 键才能被识别。
+
+**第三步**：夹好 USB 后，用键盘操控机械臂将 USB 插入孔位：
+
+- 按 `E` 键下降 + `W/S/A/D` 平移对准孔位并插入
+- USB 完全插入后，**按一下 Space 空格键**，记录一帧正样本
+- 可连续按几下空格，多采几帧
+- 按 `Q` 键上升，**先竖直抬起**再平移，避免斜向拔出碰撞
+- 如此反复：插入 → 按空格 → 竖直抬起 → 再插入 → 按空格……
+
+> **注意**：空格是**按一下触发一次**。**只在 USB 确认插好时按**；其余所有帧自动记为负样本。
+
+**第四步**：收集到 200 帧正样本后脚本自动停止，数据保存至：
+
+```
+examples/classifier_data/ur5e_usb_pickup_insertion_200_success_images_<时间戳>.pkl
+examples/classifier_data/ur5e_usb_pickup_insertion_failure_images_<时间戳>.pkl
+```
+
+#### 采集技巧
+
+| 建议 | 说明 |
 |------|------|
-| W/S/A/D/Q/E | 移动末端（平移） |
-| I/K/J/L/U/O | 旋转末端 |
-| F（按住） | 关闭夹爪 |
-| G（按住） | 打开夹爪 |
-| **Space（按住）** | 当前帧标记为**正样本（成功）** |
-| ESC | 终止当前 episode |
+| 正样本多样性 | 在略有偏差的成功位置多按几次，让分类器对轻微偏差也鲁棒 |
+| 负样本覆盖全面 | 在不同失败姿态停留（太高、太偏、未插入），让负样本分布多样 |
+| 负样本数量 | 建议负样本是正样本的 3~5 倍（脚本自动累积所有非空格帧） |
+| 光照一致性 | 采集环境的光照应与后续训练时一致 |
 
-- 默认所有帧为负样本（失败状态）
-- **按住空格键**时录制的帧标记为正样本
-- 脚本在收集到足够正样本（`--successes_needed`）后自动终止
-- 数据保存至 `experiments/ur5e_usb_pickup_insertion/classifier_data/`
+---
 
-> **建议**：收集 2~3 倍的负样本以覆盖所有失败模式。
-
-### 6.2 训练分类器
+### 6.3 训练分类器
 
 ```bash
-cd examples/experiments/ur5e_usb_pickup_insertion
-python ../../train_reward_classifier.py --exp_name ur5e_usb_pickup_insertion
+cd examples
+python train_reward_classifier.py --exp_name ur5e_usb_pickup_insertion
 ```
 
-- 模型保存至 `experiments/ur5e_usb_pickup_insertion/classifier_ckpt/`
+- 分类器模型保存至 `experiments/ur5e_usb_pickup_insertion/classifier_ckpt/`
+- 训练完成后，该模型会在 `record_demos.py` 和 `train_rlpd.py` 中自动加载，实时判断任务是否成功并给出奖励
 
 ---
 
 ## 7. 录制人工演示
+
+### 7.1 【目的】为什么需要人工演示？
+
+HIL-SERL 使用 **RLPD（Reinforcement Learning from Prior Data）** 算法，该算法可以利用人工演示数据加速学习：
+
+- 演示数据放入 **专用 demo replay buffer**，每次梯度更新有 50% 概率从中采样
+- 从零强化学习可能需要数千次 episode，有了演示数据通常 **100~300 次 episode 内就能收敛**
+- 演示数据同时为分类器提供了真实的成功轨迹分布参考
+
+---
+
+### 7.2 【操作】录制演示
 
 ```bash
 cd examples
 python record_demos.py --exp_name ur5e_usb_pickup_insertion --successes_needed 20
 ```
 
-- 使用**键盘**遥控机械臂完成 USB 拾取并插入（见[第 10 节](#10-键盘操控说明)）
-- 奖励分类器判断成功 **或** episode 超时后，机械臂自动执行复位：打开夹爪 → 下移到 USB 口 → 夹住 USB → 抬回 RESET_POSE
+**这一步你需要完整手动完成整个任务**：机械臂从 RESET_POSE 出发，你用键盘遥控，将 USB 插入孔位，分类器判断成功后该条轨迹被保存，机械臂自动复位，进入下一条演示录制。
+
+#### 录制流程（每条演示）
+
+```
+[机械臂在 RESET_POSE]
+        ↓
+  键盘遥控，引导末端靠近 USB 口
+        ↓
+  夹爪对准 → 按 E 下降 → USB 插入
+        ↓
+  分类器检测到成功（rew=1）→ done=True
+        ↓
+  本条轨迹所有帧自动保存
+        ↓
+  env.reset() 自动复位：开夹爪 → 下移 → 夹 USB → 抬回 RESET_POSE
+        ↓
+  继续录制下一条
+```
+
+- 只有**分类器判断成功的完整轨迹**才会被保存（`info["succeed"]=True`）
+- 失败或超时的轨迹自动丢弃，重新开始
 - 收集到 20 条成功演示后自动结束
-- 演示数据保存至 `experiments/ur5e_usb_pickup_insertion/demo_data/`
+- 数据保存至 `examples/demo_data/ur5e_usb_pickup_insertion_20_demos_<时间戳>.pkl`
+
+> **建议**：每条演示尽量操作干净流畅，避免大幅摆动。20 条高质量演示优于 50 条质量差的演示。
 
 ---
 
 ## 8. 策略训练（HIL-SERL）
 
-### 8.1 修改训练脚本
+### 8.1 【整体架构】Actor + Learner 是什么？
 
-**`run_actor.sh`**（无需修改，直接使用默认值）：
+HIL-SERL 将训练分为两个并行进程：
 
-```bash
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
-export XLA_PYTHON_CLIENT_MEM_FRACTION=.1
-python ../../train_rlpd.py \
-    --exp_name=ur5e_usb_pickup_insertion \
-    --checkpoint_path=/path/to/your/checkpoints/run1 \
-    --actor
+```
+┌─────────────────────────────────┐        ┌────────────────────────────────┐
+│           ACTOR 进程             │        │          LEARNER 进程           │
+│  （必须连接机器人，在机器人旁）    │        │  （只需 CPU/GPU，可在另一台机器） │
+│                                 │        │                                │
+│  1. 用当前策略控制机械臂执行任务  │──数据──▶│  1. 从 replay buffer 采样      │
+│  2. 收集 (obs, action, reward)  │        │  2. 计算梯度，更新网络参数       │
+│  3. 存入 replay buffer          │◀─参数──│  3. 推送最新网络参数给 Actor    │
+│  4. 键盘干预时记录人工动作       │        │  4. 同时利用 demo data 加速训练  │
+└─────────────────────────────────┘        └────────────────────────────────┘
+           ↑ agentlace 网络通信（默认 localhost，可跨机器）
 ```
 
-**`run_learner.sh`**（修改 `--demo_path` 和 `--checkpoint_path`）：
+**可以跑在同一台机器上**（使用 `--ip localhost`，默认就是），开两个终端即可。如果有独立 GPU 机器可以把 Learner 单独放过去。
+
+---
+
+### 8.2 修改启动脚本路径
+
+编辑 `run_learner.sh`，将 `--demo_path` 改为第 7 步实际生成的文件：
 
 ```bash
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
-export XLA_PYTHON_CLIENT_MEM_FRACTION=.3
-python ../../train_rlpd.py \
-    --exp_name=ur5e_usb_pickup_insertion \
-    --checkpoint_path=/path/to/your/checkpoints/run1 \
-    --demo_path=/path/to/demo_data/demos.pkl \
-    --learner
+# run_learner.sh 中修改这一行：
+--demo_path=demo_data/ur5e_usb_pickup_insertion_20_demos_<时间戳>.pkl
 ```
 
-### 8.2 启动训练（两个终端）
+如需自定义 checkpoint 保存路径，同时修改两个脚本的 `--checkpoint_path`：
 
 ```bash
-# 终端 1 ── Actor（在机器人旁，需要使用键盘）
-cd examples/experiments/ur5e_usb_pickup_insertion
-bash run_actor.sh
+--checkpoint_path=/home/zzw/project/hil-serl/checkpoints/run1
+```
 
-# 终端 2 ── Learner（可在另一台 GPU 机器上）
+---
+
+### 8.3 启动训练
+
+**先启动 Learner，再启动 Actor**（Learner 要先建好参数服务器）：
+
+```bash
+# 终端 1 ── 先启动 Learner
 cd examples/experiments/ur5e_usb_pickup_insertion
 bash run_learner.sh
+
+# 终端 2 ── 再启动 Actor（机器人旁，需要键盘焦点）
+cd examples/experiments/ur5e_usb_pickup_insertion
+bash run_actor.sh
 ```
 
-若 Learner 在**另一台机器**上运行，还需在 Actor 端指定 Learner 的 IP：
+若 Learner 在**另一台机器**上，在 Actor 端指定 IP：
 
 ```bash
-bash run_actor.sh --ip <LEARNER_MACHINE_IP>
+bash run_actor.sh --ip <LEARNER_IP>
 ```
 
-### 8.3 训练过程中的人工干预
+---
 
-键盘干预策略（参考 Franka 训练经验）：
+### 8.4 训练阶段的完整流程
 
-| 训练阶段 | 建议干预频率 |
-|----------|------------|
-| 训练初期（前 100 episode） | 频繁介入，每 20~30 步引导一次，帮助策略获得奖励 |
-| 中期策略有改善后 | 仅当策略重复错误行为时介入 |
-| 后期接近收敛 | 几乎不介入，仅纠正边缘案例 |
+```
+[启动 Learner] → 加载 demo 数据，初始化 replay buffer，建立参数服务
+        ↓
+[启动 Actor]  → 连接机器人，加载分类器，从 Learner 拉取初始参数
+        ↓
+[Episode 开始] → env.reset() 机械臂回到 RESET_POSE
+        ↓
+[每一步 step]：
+  ① Actor 用当前策略预测动作
+  ② 机械臂执行
+  ③ 分类器给出奖励（success=1 / fail=0）
+  ④ 数据推送给 Learner 的 replay buffer
+  ⑤ 如果你按键盘干预，干预动作替换策略动作，记为 intervene_action 存入 buffer
+        ↓
+[done=True（成功 or 超时）] → env.reset() 复位 → 下一个 episode
+        ↓
+[Learner 持续后台训练]：
+  每 N 步更新一次网络 → 推送最新参数给 Actor
+        ↓
+[重复，直到策略收敛]
+```
 
-干预动作自动存入 replay buffer 的 `intervene_action` 字段，被训练算法识别为人类示范。
+---
+
+### 8.5 训练过程中的人工干预策略
+
+训练阶段你坐在机器人旁边，随时可以用键盘干预。干预的动作会替代策略动作并存入 replay buffer，被算法当作高质量示范。
+
+| 训练阶段 | 建议干预频率 | 目的 |
+|----------|------------|------|
+| 初期（前 50 episode） | 高频干预，每次任务基本靠你完成 | 让 replay buffer 里充满成功轨迹，确保分类器能给出奖励信号 |
+| 中期（50~200 episode） | 策略出现明显错误时才介入 | 纠正策略的系统性错误，避免策略陷入局部最优 |
+| 后期（200+ episode） | 几乎不介入 | 验证策略是否真正自主学会任务 |
+
+> **核心原则**：初期不干预策略可能永远拿不到奖励（永远失败 → 永远学不到）；后期过度干预会让策略依赖人类，无法真正自主。
 
 ---
 

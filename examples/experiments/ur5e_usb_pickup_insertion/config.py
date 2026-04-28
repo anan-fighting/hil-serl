@@ -1,16 +1,13 @@
 """
 UR5e USB Pick-Up & Insertion — Training Configuration.
 
-相机布局（与 Franka USB 任务一致）：
-  wrist_1        — 腕部相机 1（策略输入）
-  wrist_2        — 腕部相机 2（策略输入）
-  side_policy    — 侧方相机策略视图（策略输入）
-  side_classifier — 侧方相机分类器视图（仅用于奖励分类器，与 side_policy 共用同一物理相机）
+相机布局（单腕部相机版本）：
+  wrist_1        — 腕部相机（策略输入 + 奖励分类器共用同一物理相机）
 
 修改清单（上机前必改）：
   [1] ROBOT_IP              — UR5e 的 IP 地址
-  [2] REALSENSE_CAMERAS     — 各相机序列号
-  [3] IMAGE_CROP            — 各相机的图像裁剪范围（先跑 record_success_fail.py 预览）
+  [2] REALSENSE_CAMERAS     — 腕部相机序列号
+  [3] IMAGE_CROP            — 相机的图像裁剪范围（先跑 record_success_fail.py 预览）
   [4] TARGET_POSE           — USB 完全插入时的末端位姿（用 get_tcp_pose.py 采集）
   [5] RESET_POSE            — 每个 episode 开始时的末端位姿
   [6] ABS_POSE_LIMIT_*      — 安全探索边界
@@ -48,31 +45,14 @@ class EnvConfig(DefaultUR5eEnvConfig):
     ROBOT_IP = "192.168.1.103"
 
     # ------------------------------------------------------------------
-    # [2] 相机配置
-    #   side_policy 与 side_classifier 的 serial_number 填写同一个序列号，
-    #   wrapper.py 中会让它们共用同一 VideoCapture 对象（避免重复初始化）。
+    # [2] 相机配置（单腕部相机）
+    #   只保留 wrist_1，策略观测与奖励分类器共用同一物理相机。
     # ------------------------------------------------------------------
     REALSENSE_CAMERAS = {
         "wrist_1": {
-            "serial_number": "REPLACE_WRIST1_SERIAL",
+            "serial_number": "315122272182",
             "dim": (1280, 720),
-            "exposure": 10500,
-        },
-        "wrist_2": {
-            "serial_number": "REPLACE_WRIST2_SERIAL",
-            "dim": (1280, 720),
-            "exposure": 10500,
-        },
-        "side_policy": {
-            "serial_number": "REPLACE_SIDE_SERIAL",
-            "dim": (1280, 720),
-            "exposure": 13000,
-        },
-        "side_classifier": {
-            # 与 side_policy 填写相同序列号；wrapper 会共用 capture 对象
-            "serial_number": "REPLACE_SIDE_SERIAL",
-            "dim": (1280, 720),
-            "exposure": 13000,
+            "exposure": 25000,
         },
     }
 
@@ -80,10 +60,7 @@ class EnvConfig(DefaultUR5eEnvConfig):
     # [3] 图像裁剪（先运行 record_success_fail.py 预览后调整）
     # ------------------------------------------------------------------
     IMAGE_CROP = {
-        "wrist_1":         lambda img: img[50:-200, 200:-200],
-        "wrist_2":         lambda img: img[:-200,   200:-200],
-        "side_policy":     lambda img: img[250:500,  350:650],
-        "side_classifier": lambda img: img[270:398,  500:628],
+        "wrist_1": lambda img: img[50:-200, 200:-200],
     }
 
     # ------------------------------------------------------------------
@@ -97,16 +74,29 @@ class EnvConfig(DefaultUR5eEnvConfig):
     # ------------------------------------------------------------------
 
     # USB 完全插入 USB 口时的末端位姿（rotvec，需用 get_tcp_pose.py 实测采集）
-    TARGET_POSE = np.array([0.553, 0.177, 0.251, np.pi, 0.0, -np.pi / 2])
+    # PS: UR示教器上TCP位姿为[0, 0, 190] mm
+    TARGET_POSE = np.array([0.243049, -0.448224, 0.142155, 0.220175, 3.133029, -0.004121])
 
     # 每个 episode 开始时的末端位姿（rotvec，在 TARGET_POSE 基础上偏移）
-    RESET_POSE = TARGET_POSE + np.array([0.0, 0.03, 0.05, 0.0, 0.0, 0.0])
+    RESET_POSE = TARGET_POSE + np.array([-0.1, 0.1, 0.2, 0.0, 0.0, 0.0])
 
     # ------------------------------------------------------------------
     # [5] 安全探索边界（rotvec 分量，与 TARGET_POSE 同格式）
+    #
+    # ⚠️ 重要：边界必须完整包含 RESET_POSE，否则第一次 step() 就会把
+    #    机械臂从 RESET_POSE 强制夹到边界，导致"飞车"！
+    #
+    #   RESET_POSE 相对 TARGET_POSE 的偏移：[-0.1, +0.1, +0.2, 0, 0, 0]
+    #   因此各轴下限/上限需覆盖上述偏移并留有余量。
+    #
+    #   当前设置（示意，可根据实际工作空间微调）：
+    #     x: TARGET ± 0.12 m  → 覆盖 -0.1 偏移
+    #     y: -0.08 / +0.12 m  → 覆盖 +0.1 偏移
+    #     z: -0.05 / +0.22 m  → 覆盖 +0.2 偏移
+    #     rot: ±0.1 rad        → 允许微量姿态调整
     # ------------------------------------------------------------------
-    ABS_POSE_LIMIT_HIGH = TARGET_POSE + np.array([0.03, 0.06, 0.05, 0.1, 0.1, 0.3])
-    ABS_POSE_LIMIT_LOW  = TARGET_POSE - np.array([0.03, 0.01, 0.03, 0.1, 0.1, 0.3])
+    ABS_POSE_LIMIT_HIGH = TARGET_POSE + np.array([0.2, 0.2, 0.2, 0.1, 0.1, 0.1])
+    ABS_POSE_LIMIT_LOW  = TARGET_POSE - np.array([0.2, 0.2, 0.2, 0.1, 0.1, 0.1])
 
     # ------------------------------------------------------------------
     # 动作缩放  (translation_m, rotation_rad, gripper)
@@ -121,7 +111,7 @@ class EnvConfig(DefaultUR5eEnvConfig):
     # ------------------------------------------------------------------
     # [6] 关节复位目标角度（弧度，6 个关节）
     # ------------------------------------------------------------------
-    RESET_JOINTS = np.array([-1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0.0])
+    RESET_JOINTS = np.array([1.696414, -1.552883, 1.655629, -1.6759, -1.570164, 0.268404])
 
     # 夹爪
     GRIPPER_TYPE     = "robotiq"
@@ -149,10 +139,10 @@ class EnvConfig(DefaultUR5eEnvConfig):
 #  训练配置
 # ============================================================
 class TrainConfig(DefaultTrainingConfig):
-    # 策略观测使用的图像键
-    image_keys      = ["side_policy", "wrist_1", "wrist_2"]
-    # 奖励分类器使用的图像键（侧方相机裁剪更小的视图）
-    classifier_keys = ["side_classifier"]
+    # 策略观测使用的图像键（单腕部相机）
+    image_keys      = ["wrist_1"]
+    # 奖励分类器使用的图像键（与策略观测相同，共用 wrist_1）
+    classifier_keys = ["wrist_1"]
     # 本体感知键
     proprio_keys    = ["tcp_pose", "tcp_vel", "tcp_force", "tcp_torque", "gripper_pose"]
 

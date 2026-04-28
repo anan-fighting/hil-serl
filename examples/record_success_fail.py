@@ -12,6 +12,9 @@ from experiments.mappings import CONFIG_MAPPING
 FLAGS = flags.FLAGS
 flags.DEFINE_string("exp_name", None, "Name of experiment corresponding to folder.")
 flags.DEFINE_integer("successes_needed", 200, "Number of successful transistions to collect.")
+flags.DEFINE_boolean("skip_grasp", False,
+                     "If True, skip the full grasp/reset sequence on env.reset(). "
+                     "Use this for image preview / classifier data collection on UR5e.")
 
 
 success_key = False
@@ -32,12 +35,16 @@ def main(_):
     config = CONFIG_MAPPING[FLAGS.exp_name]()
     env = config.get_environment(fake_env=False, save_video=False, classifier=False)
 
+    # 通过底层 env 属性传递 skip_grasp，绕过 gymnasium wrapper 的固定签名限制
+    env.unwrapped.skip_grasp = FLAGS.skip_grasp
+
     obs, _ = env.reset()
     successes = []
     failures = []
     success_needed = FLAGS.successes_needed
+    print(f"--- Collecting {success_needed} successful transitions...")
     pbar = tqdm(total=success_needed)
-    
+     
     while len(successes) < success_needed:
         actions = np.zeros(env.action_space.sample().shape) 
         next_obs, rew, done, truncated, info = env.step(actions)
